@@ -259,6 +259,53 @@ def _looks_like_harness_user_message(content) -> bool:
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
 
 
+# 成对的 XML 风格 harness 标签块（可从混合消息中安全剥离）
+_XML_HARNESS_TAGS = (
+    "system-reminder",
+    "environment_context",
+    "permissions instructions",
+    "collaboration_mode",
+    "skills_instructions",
+    "plugins_instructions",
+)
+
+# 行级 harness 标题：AGENTS.md / claudeMd 是用户自己写的指引（非客户端合规模板），
+# 剥掉标题行、保留正文；其余纯 harness 标记才整条视为 harness
+_LINE_HARNESS_PREFIXES = (
+    "# AGENTS.md instructions",
+    "# claudeMd",
+)
+
+MAX_AGENTS_INSTRUCTIONS_CHARS = 8000
+
+
+def _strip_harness_blocks(text: str) -> str:
+    """剥离 user 消息里成对的 harness 标签块，返回剩余的真实用户文本。
+
+    混合消息（真实提问 + harness 注入的 reminder）只删标签块、保留提问；
+    剥离后为空说明是纯 harness 消息，由调用方决定是否用固定摘要替代。
+    """
+    if not text:
+        return ""
+    out = text
+    for tag in _XML_HARNESS_TAGS:
+        out = re.sub(
+            r"\s*" + re.escape(f"<{tag}>") + r".*?" + re.escape(f"</{tag}>") + r"\s*",
+            "\n",
+            out,
+            flags=re.DOTALL,
+        )
+    stripped = out.strip()
+    for prefix in _LINE_HARNESS_PREFIXES:
+        if stripped.startswith(prefix):
+            body = stripped[len(prefix):].lstrip("\n").strip()
+            # 保留用户写的指引正文（截断防膨胀），标题行剥掉
+            if len(body) > MAX_AGENTS_INSTRUCTIONS_CHARS:
+                body = body[:MAX_AGENTS_INSTRUCTIONS_CHARS].rstrip() + " …"
+            return body
+    return stripped
+
+
 def _prune_runtime_fragments(role: str, text: str) -> str:
     """轻量裁掉冗长的运行时元数据，保留主要行为指令。
 
@@ -311,15 +358,14 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
             pruned = _CODEX_CORE_SUMMARY
 
     if role == "user" and _looks_like_harness_user_message(pruned):
-        if (
-            "# AGENTS.md instructions" in pruned
-            or "<environment_context>" in text
-            or "<skills_instructions>" in text
-        ):
+        # 混合消息：剥离 harness 标签块、保留用户真实文本；纯 harness 才用摘要
+        stripped = _strip_harness_blocks(text)
+        if not stripped:
             return (
                 "Repository instructions and durable user context are provided. "
                 "Follow repository guidance while answering the user's actual request."
             )
+        pruned = stripped
 
     pruned = re.sub(r"\n{3,}", "\n\n", pruned).strip()
     return pruned
@@ -350,6 +396,10 @@ def _compact_harness_message(role: str, content) -> str | None:
             "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable."
         )
     if role == "user" and _looks_like_harness_user_message(content):
+        # 混合消息：剥离 harness 标签块、保留用户真实文本；纯 harness 才用摘要
+        stripped = _strip_harness_blocks(text)
+        if stripped:
+            return stripped
         return (
             "Repository instructions and environment context are provided. Follow repository guidance "
             "while answering the user's actual request."
@@ -358,20 +408,37 @@ def _compact_harness_message(role: str, content) -> str | None:
 
 
 def _desensitize_tool_value(value: Any, strip_metadata: bool = False):
-    """递归处理 tool 定义，必要时移除高风险描述字段。"""
+    """递归处理 tool 定义；strip_metadata 模式下保留一句指引而非整体删除。"""
     if isinstance(value, dict):
         new_value = {}
         for key, item in value.items():
-            if key in ("description", "title") and isinstance(item, str):
+            if key == "description" and isinstance(item, str):
                 if strip_metadata:
-                    continue
-                new_value[key] = desensitize_text(item)
+                    # 保留首行/首句作为功能指引，删掉其余大段使用说明
+                    new_value[key] = desensitize_text(_abbreviate_description(item))
+                else:
+                    new_value[key] = desensitize_text(item)
+            elif key == "title" and isinstance(item, str):
+                new_value[key] = desensitize_text(item)  # title 通常很短，保留
             else:
                 new_value[key] = _desensitize_tool_value(item, strip_metadata=strip_metadata)
         return new_value
     if isinstance(value, list):
         return [_desensitize_tool_value(item, strip_metadata=strip_metadata) for item in value]
     return value
+
+
+MAX_TOOL_DESCRIPTION_CHARS = 240
+
+
+def _abbreviate_description(text: str, limit: int = MAX_TOOL_DESCRIPTION_CHARS) -> str:
+    """取工具 description 的首行（无换行则取整段开头）作为一句指引。"""
+    if not text:
+        return text
+    first_line = text.strip().split("\n", 1)[0].strip()
+    if len(first_line) <= limit:
+        return first_line
+    return first_line[: limit - 1].rstrip() + "…"
 
 
 def desensitize_messages(messages: Iterable[dict],

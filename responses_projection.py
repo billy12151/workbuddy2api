@@ -21,6 +21,7 @@ Codex CLI 会把大量运行时提示、完整工具 schema、长历史、以及
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -47,6 +48,39 @@ HARNESS_USER_MARKERS = (
     "# claudeMd",
 )
 
+
+def _strip_harness_blocks(text: str) -> str:
+    """剥离 user 消息里成对的 harness 标签块，返回剩余的真实用户文本。
+
+    与 desensitize 模块的同名逻辑保持一致；此处内联以维持本模块零依赖。
+    """
+    if not text:
+        return ""
+    out = text
+    for tag in (
+        "system-reminder",
+        "environment_context",
+        "permissions instructions",
+        "collaboration_mode",
+        "skills_instructions",
+        "plugins_instructions",
+    ):
+        out = re.sub(
+            r"\s*" + re.escape(f"<{tag}>") + r".*?" + re.escape(f"</{tag}>") + r"\s*",
+            "\n",
+            out,
+            flags=re.DOTALL,
+        )
+    stripped = out.strip()
+    for prefix in ("# AGENTS.md instructions", "# claudeMd"):
+        if stripped.startswith(prefix):
+            body = stripped[len(prefix):].lstrip("\n").strip()
+            # 用户自己写的指引：保留正文（截断防膨胀），只剥标题行
+            if len(body) > 8000:
+                body = body[:8000].rstrip() + " …"
+            return body
+    return stripped
+
 HARNESS_SYSTEM_MARKERS = (
     "You are a coding agent running in the Codex CLI",
     "Within this context, Codex refers to",
@@ -61,24 +95,24 @@ HARNESS_SYSTEM_MARKERS = (
 )
 
 BASE_SYSTEM_PROMPT = (
-    "You are a coding assistant serving an OpenAI-compatible CLI. "
-    "Be precise, concise, safe, and action-oriented. "
-    "Use available tools when needed, follow repository instructions and durable user context, "
-    "and continue from the preserved recent context. "
-    "If earlier history was condensed, rely on the preserved recent messages and rerun tools when exact old details are required."
+    "你是一个乐于助人的编程助手。帮助用户完成软件工程任务。"
+    "需要时使用提供的工具。"
+    "用与用户相同的语言回复。"
 )
 
 HISTORY_PREFIX = "Earlier conversation summary (condensed):"
 
-MAX_SYSTEM_GUIDANCE_CHARS = 1200
-MAX_USER_CHARS = 3200
-MAX_ASSISTANT_CHARS = 1800
-MAX_TOOL_OUTPUT_CHARS = 1600
-MAX_TOOL_ARGS_CHARS = 900
-MAX_HISTORY_SUMMARY_CHARS = 2200
-MAX_HISTORY_ITEMS = 10
-MAX_TAIL_MESSAGES = 8
-MAX_TAIL_CHARS = 7000
+# 预算参考：Hy3 上下文 256K token。tail 预算 120K 字符 + 历史摘要 24K + system，
+# 合计约 150K 字符（≈ 40-60K token），远低于窗口上限，同时让尾部工作集基本完整。
+MAX_SYSTEM_GUIDANCE_CHARS = 4000
+MAX_USER_CHARS = 20000
+MAX_ASSISTANT_CHARS = 20000
+MAX_TOOL_OUTPUT_CHARS = 50000
+MAX_TOOL_ARGS_CHARS = 4000
+MAX_HISTORY_SUMMARY_CHARS = 24000
+MAX_HISTORY_ITEMS = 60
+MAX_TAIL_MESSAGES = 60
+MAX_TAIL_CHARS = 120000
 
 SCHEMA_KEEP_KEYS = {
     "type",
@@ -98,6 +132,8 @@ SCHEMA_KEEP_KEYS = {
     "minLength",
     "maxLength",
     "nullable",
+    "description",  # 参数级一句说明，保留给模型；脱敏层会做零宽处理
+    "title",
 }
 
 
@@ -147,7 +183,13 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
             continue
 
         if role == "user" and _looks_like_harness_user(text):
-            dropped_harness_messages += 1
+            # 混合消息（真实提问 + harness 注入）：只剥离标签块、保留提问；
+            # 剥离后为空才是纯 harness 消息，才整条丢弃
+            kept_text = _strip_harness_blocks(text)
+            if not kept_text:
+                dropped_harness_messages += 1
+                continue
+            conversation.append({"role": "user", "content": kept_text})
             continue
 
         projected_msg = _project_conversation_message(msg)
@@ -360,6 +402,10 @@ def _project_tools(tools: list[dict]) -> tuple[list[dict], dict]:
             continue
 
         projected_function: dict[str, Any] = {"name": name}
+        # 保留一句功能指引，模型才知道每个工具是干什么的；后续脱敏层会再做零宽处理
+        desc = function.get("description")
+        if isinstance(desc, str) and desc.strip():
+            projected_function["description"] = desc.strip().split("\n", 1)[0][:240]
         if "parameters" in function:
             projected_function["parameters"] = _project_schema(function.get("parameters"))
         if "strict" in function:
@@ -465,7 +511,9 @@ def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str,
     total_chars = 0
     summarized = 0
 
-    for msg in messages:
+    # 从最近的被省略历史往回收：tail 之前的那几轮对话优先进入摘要，
+    # 而不是最早的 60 条（否则模型对"前几轮说了什么"毫无记忆）。
+    for msg in reversed(messages):
         line = _history_line(msg, tool_name_by_call_id)
         if not line:
             continue
@@ -474,6 +522,7 @@ def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str,
         lines.append(f"- {line}")
         total_chars += len(line)
         summarized += 1
+    lines.reverse()
 
     remaining = len(messages) - summarized
     if remaining > 0:
@@ -556,47 +605,36 @@ def _summarize_tool_output(text: str) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    if len(text) <= MAX_TOOL_OUTPUT_CHARS and text.count("\n") <= 24:
+    # 尾部工作集的文件/命令输出：阈值内必须原样保留，不能按行做头尾摘要，
+    # 否则模型读到的是残缺文件（曾导致 Codex 读文件只剩头 10 行尾 6 行）。
+    if len(text) <= MAX_TOOL_OUTPUT_CHARS:
         return text
 
+    # 超长输出：剔除运行时噪声行后按字符保留头尾（约 2/3 头 + 1/3 尾），
+    # 中段标注省略量，模型仍能看清结构并用 offset 续读。
     lines = text.splitlines()
     exit_line = next((line.strip() for line in lines if "Process exited with code" in line), "")
-    useful_lines = []
-    saw_output = False
-    for line in lines:
-        stripped = line.rstrip()
-        if stripped == "Output:":
-            saw_output = True
-            continue
-        if (
-            stripped.startswith("Chunk ID:")
-            or stripped.startswith("Wall time:")
-            or stripped.startswith("Original token count:")
-            or stripped.startswith("Process exited with code")
-        ):
-            continue
-        useful_lines.append(stripped)
-
-    body_lines = useful_lines
-
-    head = body_lines[:10]
-    tail = body_lines[-6:] if len(body_lines) > 16 else []
-    omitted = max(len(body_lines) - len(head) - len(tail), 0)
+    noise_prefixes = (
+        "Chunk ID:",
+        "Wall time:",
+        "Original token count:",
+        "Process exited with code",
+    )
+    body = "\n".join(line for line in lines if not line.startswith(noise_prefixes))
+    head_keep = MAX_TOOL_OUTPUT_CHARS * 2 // 3
+    tail_keep = MAX_TOOL_OUTPUT_CHARS // 3
+    head = body[:head_keep].rstrip()
+    tail = body[-tail_keep:].lstrip() if tail_keep else ""
+    omitted = len(body) - len(head) - len(tail)
 
     parts: list[str] = []
     if exit_line:
         parts.append(exit_line)
-    if head:
-        parts.append("Key output:")
-        parts.extend(head)
-    if omitted:
-        parts.append(f"... [omitted {omitted} lines] ...")
-    if tail:
-        parts.append("Recent tail:")
-        parts.extend(tail)
-
-    summary = "\n".join(part for part in parts if part).strip()
-    return _truncate_text(summary or text, MAX_TOOL_OUTPUT_CHARS)
+    parts.append(head)
+    if tail and omitted > 0:
+        parts.append(f"... [{omitted} chars omitted] ...")
+        parts.append(tail)
+    return "\n".join(parts)
 
 
 def _tool_output_inline_summary(text: str) -> str:

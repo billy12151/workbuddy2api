@@ -147,11 +147,17 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type == "function_call":
             if pending_assistant_content is None:
                 pending_assistant_content = ""
+            name = item.get("name", "")
+            # Codex 0.146+ 的 namespace 工具调用带独立 namespace 字段（如 mcp__memory_arbiter
+            # + 裸名 memory）；Chat 后端只认扁平全名，这里合并成 mcp__memory_arbiter__memory
+            ns = item.get("namespace")
+            if ns and name and not name.startswith(ns + "__"):
+                name = f"{ns}__{name}"
             pending_tool_calls.append({
                 "id": item.get("call_id", item.get("id", _rand_id("call_"))),
                 "type": "function",
                 "function": {
-                    "name": item.get("name", ""),
+                    "name": name,
                     "arguments": item.get("arguments", "{}"),
                 },
             })
@@ -164,6 +170,34 @@ def _convert_input_items(items: list) -> list[dict]:
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
                 "content": item.get("output", ""),
+            })
+            continue
+
+        # tool_search_call（历史轮模型发起的检索）→ 合并到 assistant tool_calls，
+        # 这样 Chat 后端能看到的调用链是完整的 function_call(name=tool_search)
+        if item_type == "tool_search_call":
+            if pending_assistant_content is None:
+                pending_assistant_content = ""
+            args = item.get("arguments")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            pending_tool_calls.append({
+                "id": item.get("call_id", item.get("id", _rand_id("call_"))),
+                "type": "function",
+                "function": {"name": "tool_search", "arguments": args or "{}"},
+            })
+            continue
+
+        # tool_search_output（Codex 客户端执行的检索结果）→ tool 消息
+        if item_type == "tool_search_output":
+            _flush_assistant()
+            tools_payload = item.get("tools")
+            content = tools_payload if isinstance(tools_payload, str) \
+                else json.dumps(tools_payload, ensure_ascii=False)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": content or "[]",
             })
             continue
 
@@ -204,15 +238,47 @@ def _extract_output_text(content_parts: list) -> str:
     return "".join(texts)
 
 
+# Codex 0.146+ 将 MCP 工具延迟注册（ToolSearchAlwaysDeferMcpTools），模型只能通过
+# Responses 原生工具 {"type": "tool_search", "execution": "client"} 按需检索。
+# 后端是 Chat 协议不认识该类型，这里转成普通 function 工具，名字保留 tool_search，
+# 响应方向再把 name=tool_search 的 function_call 还原成 tool_search_call 事件。
+TOOL_SEARCH_DESCRIPTION = (
+    "Search for extra tools not currently listed (e.g. MCP server or app tools) by keywords; "
+    "returned tools become directly callable by their exact name as function tools.\n"
+    "Use this whenever a task seems to need a tool that is not in your tool list, "
+    "for example memory, browser automation, or app-specific capabilities."
+)
+
+TOOL_SEARCH_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Keywords to match tools by name or description"},
+        "limit": {"type": "integer", "description": "Maximum number of tools to return", "default": 8},
+    },
+    "required": ["query"],
+    "additionalProperties": False,
+}
+
+
 def _convert_tools_for_chat(tools: list) -> list:
     """将 Responses 格式的 tools 转为 Chat 格式。
 
     Responses:  {"type": "function", "name": "shell", "description": ..., "parameters": ...}
     Chat:       {"type": "function", "function": {"name": "shell", "description": ..., "parameters": ...}}
+
+    非 function 的原生类型里只透传 tool_search（转成 function）；custom/web_search 等
+    后端无法执行的类型维持丢弃。
     """
     result = []
     for t in tools:
         if not isinstance(t, dict):
+            continue
+        if t.get("type") == "tool_search":
+            result.append({"type": "function", "function": {
+                "name": "tool_search",
+                "description": TOOL_SEARCH_DESCRIPTION,
+                "parameters": TOOL_SEARCH_PARAMETERS,
+            }})
             continue
         if t.get("type") != "function":
             continue
@@ -309,9 +375,11 @@ class ResponsesStreamConverter:
             tc = self._tool_calls[idx]
             if tc.get("emitted"):
                 oi = tc["output_idx"]
-                events.append(self._evt("response.function_call_arguments.done", {
-                    "output_index": oi, "arguments": tc["args"]
-                }))
+                # arguments done 事件只适用于 function_call，tool_search_call 不发
+                if tc.get("name") != "tool_search":
+                    events.append(self._evt("response.function_call_arguments.done", {
+                        "output_index": oi, "arguments": tc["args"]
+                    }))
                 events.append(self._evt("response.output_item.done", {
                     "output_index": oi, "item": self._fc_item(tc, "completed")
                 }))
@@ -406,10 +474,12 @@ class ResponsesStreamConverter:
 
                 if fn.get("arguments"):
                     slot["args"] += fn["arguments"]
-                    events.append(self._evt("response.function_call_arguments.delta", {
-                        "output_index": slot["output_idx"],
-                        "delta": fn["arguments"]
-                    }))
+                    # arguments delta/done 事件只适用于 function_call，tool_search_call 不发
+                    if slot.get("name") != "tool_search":
+                        events.append(self._evt("response.function_call_arguments.delta", {
+                            "output_index": slot["output_idx"],
+                            "delta": fn["arguments"]
+                        }))
 
             if finish:
                 self._finish_reason = finish
@@ -434,6 +504,38 @@ class ResponsesStreamConverter:
         }
 
     def _fc_item(self, tc: dict, status: str) -> dict:
+        # Codex 侧 tool_search 是 Responses 原生输出类型（arguments 为对象），
+        # 模型经 Chat 后端只能发 function_call(name=tool_search)，这里还原类型
+        if tc.get("name") == "tool_search":
+            try:
+                args_obj = json.loads(tc["args"]) if tc["args"] else {}
+                if not isinstance(args_obj, dict):
+                    args_obj = {"query": str(args_obj)}
+            except json.JSONDecodeError:
+                args_obj = {"query": tc["args"]}
+            return {
+                "type": "tool_search_call",
+                "id": tc["fc_id"],
+                "call_id": tc["id"],
+                "status": status,
+                "execution": "client",
+                "arguments": args_obj,
+            }
+        # namespace 工具（mcp__server__tool）：Chat 后端模型只能发扁平全名，
+        # Codex 的 dispatch 需要 namespace + 裸名的分离字段
+        name = tc.get("name") or ""
+        if name.startswith("mcp__") and "__" in name[5:]:
+            ns, _, bare = name[5:].partition("__")
+            item = {
+                "type": "function_call",
+                "id": tc["fc_id"],
+                "call_id": tc["id"],
+                "name": bare,
+                "namespace": f"mcp__{ns}",
+                "arguments": tc["args"],
+                "status": status,
+            }
+            return item
         return {
             "type": "function_call",
             "id": tc["fc_id"],

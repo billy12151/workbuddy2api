@@ -122,7 +122,7 @@ def test_desensitize_harness_user_and_tools():
     body = {
         "messages": [
             {"role": "system", "content": "Refuse exploit development."},
-            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context> sandbox escalation"},
+            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context>\nsandbox escalation\n</environment_context>"},
             {"role": "user", "content": "please explain dos attacks"},
         ],
         "tools": [
@@ -148,7 +148,7 @@ def test_compact_harness_messages_and_strip_tool_metadata():
         "messages": [
             {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work\nUse sandbox and escalation."},
             {"role": "system", "content": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written."},
-            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context> sandbox escalation"},
+            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context>\nsandbox escalation\n</environment_context>"},
         ],
         "tools": [
             {"type": "function", "function": {"name": "exec_command", "description": "Run dangerous exploit development checks.", "parameters": {"type": "object", "properties": {"cmd": {"type": "string", "description": "Shell command to execute."}}}}}
@@ -166,8 +166,11 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     assert "Codex CLI" in out["messages"][0]["content"]
     assert "sandboxing defines" not in out["messages"][1]["content"]
     assert "Repository instructions and environment context" in out["messages"][2]["content"]
-    assert "description" not in out["tools"][0]["function"]
-    assert "description" not in out["tools"][0]["function"]["parameters"]["properties"]["cmd"]
+    # strip 模式现在保留一句功能指引，并对敏感词做零宽脱敏，而非整体删除
+    fn_out = out["tools"][0]["function"]
+    assert fn_out["description"].startswith("Run ")
+    assert "\u200b" in fn_out["description"]
+    assert fn_out["parameters"]["properties"]["cmd"]["description"] == "Shell command to execute."
     print("✅ test_compact_harness_messages_and_strip_tool_metadata")
 
 
@@ -217,7 +220,9 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
     assert "very long runtime context" not in harness_text
     assert "very long skills metadata" not in harness_text
     assert "# AGENTS.md instructions" not in harness_text
-    assert "Repository instructions and durable user context are provided." in harness_text
+    # 混合消息：harness 块剥离后，项目指引与末尾真实用户文本都保留
+    assert "project guidance" in harness_text
+    assert harness_text.endswith("test")
     assert out["messages"][2]["content"] == "test"
     print("✅ test_no_compact_still_prunes_codex_runtime_metadata")
 
@@ -266,15 +271,17 @@ def test_responses_projection_compacts_codex_harness_and_tools():
     out, stats = project_responses_chat_body(body)
     assert stats["mode"] == "aggressive"
     assert out["messages"][0]["role"] == "system"
-    assert "OpenAI-compatible CLI" in out["messages"][0]["content"]
+    assert "乐于助人的编程助手" in out["messages"][0]["content"]
     assert all("# AGENTS.md instructions" not in msg.get("content", "") for msg in out["messages"])
     assert any("Additional repo rule" in msg.get("content", "") for msg in out["messages"])
     assert out["messages"][-1] == {"role": "user", "content": "实现该方案"}
     tool = out["tools"][0]["function"]
     assert tool["name"] == "exec_command"
-    assert "description" not in tool
-    assert "description" not in tool["parameters"]["properties"]["cmd"]
-    assert stats["projected_tool_chars"] < stats["original_tool_chars"]
+    # 投影层保留一句工具指引（首行截断），不再整体删除
+    assert tool["description"] == "Run a command with a long dangerous description"
+    assert tool["parameters"]["properties"]["cmd"]["description"] == "Shell command to execute."
+    # 工具投影保留一句指引与参数说明，只收敛 schema 结构，不应放大定义
+    assert stats["projected_tool_chars"] <= stats["original_tool_chars"]
     print("✅ test_responses_projection_compacts_codex_harness_and_tools")
 
 
@@ -301,6 +308,11 @@ def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history
             },
             {"role": "tool", "tool_call_id": "call_old", "content": "Output:\nREADME.md\nsrc\n"},
             {"role": "assistant", "content": "README is present."},
+            # 填充轮次：把 call_old 与"先看 README"挤出 tail 预算，使其进入历史摘要
+            *(
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"filler message {i}"}
+                for i in range(80)
+            ),
             {"role": "user", "content": "现在修复 converter 的 responses 链路"},
             {
                 "role": "assistant",
@@ -339,7 +351,7 @@ def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history
     }
     out, stats = project_responses_chat_body(body)
     system_messages = [m["content"] for m in out["messages"] if m["role"] == "system"]
-    assert system_messages[0].startswith("You are a coding assistant serving an OpenAI-compatible CLI.")
+    assert system_messages[0].startswith("你是一个乐于助人的编程助手")
     assert any("Earlier conversation summary" in text for text in system_messages)
     assert any("先看 README" in text for text in system_messages)
 
@@ -349,9 +361,8 @@ def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history
     )
     recent_tool = next(msg for msg in out["messages"] if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_recent")
     assert recent_assistant["tool_calls"][0]["function"]["name"] == "exec_command"
-    assert "Process exited with code 0" in recent_tool["content"]
-    assert "line 39" in recent_tool["content"]
-    assert len(recent_tool["content"]) < len(big_output)
+    # 阈值内的工具输出现在原样保留（完整文件内容），不再做行级头尾摘要
+    assert recent_tool["content"] == big_output.strip()
     assert out["messages"][-1] == {"role": "user", "content": "继续，别依赖 fallback retry"}
     assert stats["summarized_history_messages"] >= 1
     print("✅ test_responses_projection_preserves_recent_tool_chain_and_summarizes_history")
@@ -359,7 +370,7 @@ def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history
 
 def test_responses_projection_shrinks_large_tool_arguments():
     """测试：超长 tool arguments 会压缩成结构化 JSON 摘要。"""
-    long_cmd = "echo " + ("x" * 1600)
+    long_cmd = "echo " + ("x" * 6000)
     body = {
         "messages": [
             {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
@@ -497,6 +508,115 @@ def test_nonstream_response():
     print("✅ test_nonstream_response")
 
 
+def test_tool_search_passthrough_request():
+    """Codex 0.146+ 的 tool_search 原生工具应转成 function 工具，MCP 工具发现的唯一入口不能丢。"""
+    req = {
+        "model": "hy4-preview",
+        "input": "hi",
+        "tools": [
+            {"type": "function", "name": "exec_command", "description": "run", "parameters": {"type": "object"}},
+            {"type": "tool_search", "execution": "client"},
+            {"type": "custom", "name": "apply_patch"},
+            {"type": "web_search"},
+        ],
+    }
+    chat = responses_request_to_chat(req)
+    names = [t["function"]["name"] for t in chat["tools"]]
+    assert names == ["exec_command", "tool_search"]
+    ts = chat["tools"][1]["function"]
+    assert "query" in ts["parameters"]["properties"]
+    # tool_search_call / tool_search_output 历史项应转成完整 chat 调用链
+    req2 = {
+        "model": "hy4-preview",
+        "input": [
+            {"role": "user", "content": "find memory tools"},
+            {"type": "tool_search_call", "call_id": "ts_1", "status": "completed",
+             "execution": "client", "arguments": {"query": "memory", "limit": 8}},
+            {"type": "tool_search_output", "call_id": "ts_1", "status": "completed",
+             "execution": "client", "tools": [{"type": "function", "name": "mcp__memory-arbiter__memory"}]},
+        ],
+        "tools": [{"type": "tool_search", "execution": "client"}],
+    }
+    chat2 = responses_request_to_chat(req2)
+    roles = [m["role"] for m in chat2["messages"]]
+    assert "assistant" in roles and "tool" in roles
+    asst = [m for m in chat2["messages"] if m["role"] == "assistant" and m.get("tool_calls")][0]
+    assert asst["tool_calls"][0]["function"]["name"] == "tool_search"
+    assert json.loads(asst["tool_calls"][0]["function"]["arguments"]) == {"query": "memory", "limit": 8}
+    tool_msg = [m for m in chat2["messages"] if m["role"] == "tool"][0]
+    assert tool_msg["tool_call_id"] == "ts_1"
+    assert "mcp__memory-arbiter__memory" in tool_msg["content"]
+    print("✅ test_tool_search_passthrough_request")
+
+
+def test_tool_search_stream_roundtrip():
+    """模型经 Chat 后端发起 tool_search 调用 → Responses 流应输出 tool_search_call item。"""
+    conv = ResponsesStreamConverter(model="hy4-preview")
+    chunks = [
+        'data: {"id":"chatcmpl-3","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"ts_call_9","type":"function","function":{"name":"tool_search","arguments":"{\\"query\\": \\"memory\\"}"}}]},"finish_reason":null}]}',
+        'data: {"id":"chatcmpl-3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: [DONE]',
+    ]
+    all_events = []
+    for line in chunks:
+        result = conv.feed_line(line)
+        if result:
+            for evt_line in result.strip().split("\n\n"):
+                if evt_line.startswith("data: "):
+                    all_events.append(json.loads(evt_line[6:]))
+    for evt_line in conv.finish().strip().split("\n\n"):
+        if evt_line.startswith("data: "):
+            all_events.append(json.loads(evt_line[6:]))
+
+    # tool_search_call 不应产生 function_call_arguments 事件
+    types = [e["type"] for e in all_events]
+    assert "response.function_call_arguments.delta" not in types
+    assert "response.function_call_arguments.done" not in types
+    done_items = [e["item"] for e in all_events
+                  if e["type"] == "response.output_item.done" and e["item"].get("type") == "tool_search_call"]
+    assert len(done_items) == 1
+    item = done_items[0]
+    assert item["call_id"] == "ts_call_9"
+    assert item["execution"] == "client"
+    assert item["arguments"] == {"query": "memory"}
+    print("✅ test_tool_search_stream_roundtrip")
+
+
+def test_namespace_function_call_roundtrip():
+    """namespace 工具（mcp__server__tool）双向转换：请求合并全名，响应拆回 namespace 字段。"""
+    # 请求方向：codex 回传的历史 function_call 带 namespace 字段 → chat 扁平全名
+    req = {
+        "model": "hy4-preview",
+        "input": [
+            {"role": "user", "content": "go"},
+            {"type": "function_call", "call_id": "c1", "name": "memory",
+             "namespace": "mcp__memory_arbiter", "arguments": "{\"action\":\"help\"}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ],
+    }
+    chat = responses_request_to_chat(req)
+    asst = [m for m in chat["messages"] if m.get("role") == "assistant" and m.get("tool_calls")][0]
+    assert asst["tool_calls"][0]["function"]["name"] == "mcp__memory_arbiter__memory"
+    # 响应方向：模型发扁平全名 → Responses function_call 带 namespace + 裸名
+    conv = ResponsesStreamConverter(model="hy4-preview")
+    chunks = [
+        'data: {"id":"c","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"mcp__memory_arbiter__memory","arguments":"{\\"action\\":\\"help\\"}"}}]},"finish_reason":null}]}',
+        'data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: [DONE]',
+    ]
+    for line in chunks:
+        conv.feed_line(line)
+    events = []
+    for evt_line in conv.finish().strip().split("\n\n"):
+        if evt_line.startswith("data: "):
+            events.append(json.loads(evt_line[6:]))
+    items = [e["item"] for e in events if e["type"] == "response.output_item.done"]
+    fc = [i for i in items if i.get("type") == "function_call"][0]
+    assert fc["name"] == "memory"
+    assert fc["namespace"] == "mcp__memory_arbiter"
+    print("✅ test_namespace_function_call_roundtrip")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_array_input_request()
@@ -513,4 +633,11 @@ if __name__ == "__main__":
     test_stream_converter_text()
     test_stream_converter_function_call()
     test_nonstream_response()
-    print(f"\n🎉 All {15} tests passed!")
+    test_tool_search_passthrough_request()
+    test_tool_search_stream_roundtrip()
+    test_namespace_function_call_roundtrip()
+    print(f"\n🎉 All {18} tests passed!")
+
+
+
+

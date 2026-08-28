@@ -25,6 +25,14 @@ env_key = "CODEBUDDY2OPENAI_KEY"    # 转换器未启用 --api-key 时，可随�
 
 [profiles.workbuddy]
 model = "glm-5.2"                   # 也可用 kimi-k2.7 / deepseek-v4-pro / auto 等
+
+# 使用腾讯混元 hy4 预览版（需转换器已将该模型加入 DEFAULT_MODELS）：
+#   [profiles.workbuddy]
+#   model = "hy4-preview"
+#   model_provider = "workbuddy"
+#
+# ⚠️ hy4-preview 首 token 延迟较高（实测可达 90s+，疑似冷启动/排队），
+#    请将 Codex CLI 的请求超时调大，否则等待期间易断连。
 model_provider = "workbuddy"
 
 # 然后设置环境变量（值随便填，除非转换器启用了 --api-key）：
