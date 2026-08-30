@@ -35,7 +35,8 @@ def anthropic_request_to_chat(body: dict) -> dict:
       system → messages[0] role=system
       messages[].content (blocks) → content (string) / tool_calls / tool role
       tools[].input_schema → tools[].function.parameters
-      metadata / thinking → 丢弃
+      thinking {type: enabled, budget_tokens} → reasoning_effort（档位映射）
+      metadata → 丢弃
     """
     messages: list[dict] = []
 
@@ -73,6 +74,23 @@ def anthropic_request_to_chat(body: dict) -> dict:
             chat["tool_choice"] = {"type": tc.get("type", "any"), "function": {"name": tc.get("name", "")}}
         elif isinstance(tc, str):
             chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
+
+    # thinking → reasoning_effort（后端思考开关）
+    # Anthropic 用 budget_tokens 表思考预算，后端只认 OpenAI 风格档位字符串；
+    # 实测后端接受 "max"（ZCode 会话验证），其余为标准档位值
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens") or 0
+        if not isinstance(budget, (int, float)) or isinstance(budget, bool):
+            budget = 0
+        if budget >= 16384:
+            chat["reasoning_effort"] = "max"
+        elif budget >= 8192:
+            chat["reasoning_effort"] = "high"
+        elif budget >= 4096:
+            chat["reasoning_effort"] = "medium"
+        else:
+            chat["reasoning_effort"] = "low"
 
     # 透传常见参数
     for key in ("temperature", "top_p", "stop", "top_k"):
@@ -224,6 +242,11 @@ class AnthropicStreamConverter:
         # 状态
         self._emitted_start = False
 
+        # thinking 内容块（后端 reasoning_content；Anthropic 要求 thinking 块在其他块之前）
+        self._thinking_text = ""
+        self._thinking_block_open = False
+        self._thinking_block_idx = 0
+
         # text 内容块
         self._text_content = ""
         self._text_block_open = False
@@ -257,6 +280,9 @@ class AnthropicStreamConverter:
     def finish(self) -> str:
         """流结束，发出收尾事件。"""
         events: list[str] = []
+
+        # 关闭 thinking 块（若仍开着）
+        self._close_thinking_block(events)
 
         # 关闭 text 块
         if self._text_block_open:
@@ -354,11 +380,29 @@ class AnthropicStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
+            # reasoning_content delta → thinking 块（后端思考输出）
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                self._thinking_text += reasoning
+                if not self._thinking_block_open:
+                    self._thinking_block_idx = self._next_block_idx
+                    self._next_block_idx += 1
+                    events.append(self._evt("content_block_start", {
+                        "index": self._thinking_block_idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }))
+                    self._thinking_block_open = True
+                events.append(self._evt("content_block_delta", {
+                    "index": self._thinking_block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                }))
+
             # content delta
             content = delta.get("content")
             if content:
                 self._text_content += content
                 if not self._text_block_open:
+                    self._close_thinking_block(events)
                     self._text_block_idx = self._next_block_idx
                     self._next_block_idx += 1
                     events.append(self._evt("content_block_start", {
@@ -392,6 +436,7 @@ class AnthropicStreamConverter:
                     slot["name"] = fn["name"]
 
                 if not slot["open"]:
+                    self._close_thinking_block(events)
                     events.append(self._evt("content_block_start", {
                         "index": slot["block_idx"],
                         "content_block": {"type": "tool_use", "id": slot["id"], "name": slot["name"], "input": {}},
@@ -429,9 +474,26 @@ class AnthropicStreamConverter:
         payload = {"type": event_type, **data}
         return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+    def _close_thinking_block(self, events: list[str]):
+        """关闭 thinking 块：补一个空签名（协议要求字段，回传时会被入站侧剥离）后 stop。"""
+        if not self._thinking_block_open:
+            return
+        events.append(self._evt("content_block_delta", {
+            "index": self._thinking_block_idx,
+            "delta": {"type": "signature_delta", "signature": ""},
+        }))
+        events.append(self._evt("content_block_stop", {
+            "index": self._thinking_block_idx,
+        }))
+        self._thinking_block_open = False
+
     def _build_content_blocks(self) -> list[dict]:
         """构造完整的 content blocks 数组（用于非流式响应）。"""
         blocks: list[dict] = []
+
+        # thinking block（若有思考输出，置首）
+        if self._thinking_text:
+            blocks.append({"type": "thinking", "thinking": self._thinking_text, "signature": ""})
 
         # text block
         if self._text_content or self._text_block_open:

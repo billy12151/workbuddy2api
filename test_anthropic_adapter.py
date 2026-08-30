@@ -405,6 +405,109 @@ def test_empty_messages():
     print("✅ test_empty_messages")
 
 
+def test_thinking_request_mapping():
+    """测试：thinking {type:enabled, budget_tokens} → reasoning_effort 档位映射。"""
+    base = {"model": "auto", "max_tokens": 8192, "messages": [{"role": "user", "content": "hi"}]}
+
+    # 预算档位映射
+    for budget, effort in [(2048, "low"), (4096, "medium"), (8192, "high"),
+                           (16384, "max"), (99999, "max")]:
+        req = dict(base, thinking={"type": "enabled", "budget_tokens": budget})
+        chat = anthropic_request_to_chat(req)
+        assert chat.get("reasoning_effort") == effort, f"budget={budget} → {chat.get('reasoning_effort')}"
+
+    # disabled / 字符串 / None → 不带 reasoning_effort；enabled 缺 budget 视为最低档
+    for thinking in ({"type": "disabled"}, "enabled", None):
+        req = dict(base, thinking=thinking)
+        chat = anthropic_request_to_chat(req)
+        assert "reasoning_effort" not in chat, f"thinking={thinking!r} 不应产生 reasoning_effort"
+    chat = anthropic_request_to_chat(dict(base, thinking={"type": "enabled"}))
+    assert chat.get("reasoning_effort") == "low"
+
+    # 无 thinking 字段的请求不受影响
+    chat = anthropic_request_to_chat(dict(base))
+    assert "reasoning_effort" not in chat
+    print("✅ test_thinking_request_mapping")
+
+
+def test_stream_thinking_delta():
+    """测试：reasoning_content → thinking 块，先于 text 块且提前关闭。"""
+    conv = AnthropicStreamConverter(model="deepseek-v4-pro")
+
+    chunks = [
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"让我想"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"一想"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"答案"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":9,"total_tokens":14}}',
+        'data: [DONE]',
+    ]
+
+    all_events = []
+    for line in chunks:
+        result = conv.feed_line(line)
+        if result:
+            for evt_block in result.strip().split("\n\n"):
+                if not evt_block:
+                    continue
+                for evt_line in evt_block.strip().split("\n"):
+                    if evt_line.startswith("data: "):
+                        all_events.append(json.loads(evt_line[6:]))
+    for evt_block in conv.finish().strip().split("\n\n"):
+        if not evt_block:
+            continue
+        for evt_line in evt_block.strip().split("\n"):
+            if evt_line.startswith("data: "):
+                all_events.append(json.loads(evt_line[6:]))
+
+    types = [e["type"] for e in all_events]
+
+    # thinking 块：start 在最前，delta 为 thinking_delta，text 到来前先 stop
+    assert types.index("content_block_start") == 1  # message_start 之后第一个事件
+    thinking_start = [e for e in all_events if e["type"] == "content_block_start"][0]
+    assert thinking_start["content_block"]["type"] == "thinking"
+    assert thinking_start["index"] == 0
+
+    thinking_deltas = [e for e in all_events if e["type"] == "content_block_delta"
+                       and e["delta"]["type"] == "thinking_delta"]
+    assert [d["delta"]["thinking"] for d in thinking_deltas] == ["让我想", "一想"]
+
+    # thinking stop（带空 signature_delta）必须出现在 text 块 start 之前
+    text_start_idx = next(i for i, e in enumerate(all_events)
+                          if e["type"] == "content_block_start" and e["content_block"]["type"] == "text")
+    thinking_stop_idx = next(i for i, e in enumerate(all_events)
+                             if e["type"] == "content_block_stop" and e["index"] == 0)
+    assert thinking_stop_idx < text_start_idx
+    sig = [e for e in all_events[:thinking_stop_idx] if e["type"] == "content_block_delta"
+           and e["delta"]["type"] == "signature_delta"]
+    assert sig and sig[-1]["delta"]["signature"] == ""
+
+    # text 块 index 顺延为 1
+    assert all_events[text_start_idx]["index"] == 1
+
+    # stop_reason 正常
+    md = [e for e in all_events if e["type"] == "message_delta"][0]
+    assert md["delta"]["stop_reason"] == "end_turn"
+    print("✅ test_stream_thinking_delta")
+
+
+def test_nonstream_thinking_block():
+    """测试：非流式响应包含 thinking block 且置首。"""
+    conv = AnthropicStreamConverter(model="deepseek-v4-pro")
+    for line in [
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"思考过程"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"结论"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+    ]:
+        conv.feed_line(line)
+
+    resp = conv.get_nonstream_response()
+    assert resp["content"][0] == {"type": "thinking", "thinking": "思考过程", "signature": ""}
+    assert resp["content"][1] == {"type": "text", "text": "结论"}
+    print("✅ test_nonstream_thinking_block")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_system_array()
@@ -419,4 +522,7 @@ if __name__ == "__main__":
     test_nonstream_response()
     test_nonstream_response_tool_use()
     test_empty_messages()
-    print(f"\n🎉 All {13} tests passed!")
+    test_thinking_request_mapping()
+    test_stream_thinking_delta()
+    test_nonstream_thinking_block()
+    print(f"\n🎉 All {16} tests passed!")

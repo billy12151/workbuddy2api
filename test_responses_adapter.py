@@ -617,6 +617,100 @@ def test_namespace_function_call_roundtrip():
     print("✅ test_namespace_function_call_roundtrip")
 
 
+def test_reasoning_request_object():
+    """测试：Responses reasoning {effort, summary} → Chat reasoning_effort。"""
+    body = {
+        "model": "glm-5.2",
+        "input": "hi",
+        "reasoning": {"effort": "high", "summary": "auto"},
+    }
+    chat = responses_request_to_chat(body)
+    assert chat["reasoning_effort"] == "high"
+
+    # 无 effort / 非 dict / 显式 reasoning_effort 优先级
+    assert "reasoning_effort" not in responses_request_to_chat({"model": "m", "input": "hi", "reasoning": {"summary": "auto"}})
+    assert "reasoning_effort" not in responses_request_to_chat({"model": "m", "input": "hi", "reasoning": "high"})
+    chat2 = responses_request_to_chat({"model": "m", "input": "hi",
+                                       "reasoning": {"effort": "low"}, "reasoning_effort": "max"})
+    assert chat2["reasoning_effort"] == "max"
+    print("✅ test_reasoning_request_object")
+
+
+def test_stream_reasoning_summary():
+    """测试：reasoning_content → reasoning item + summary 事件，index 先于 message。"""
+    conv = ResponsesStreamConverter(model="glm-5.2")
+
+    chunks = [
+        'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+        'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"先分析"},"finish_reason":null}]}',
+        'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"问题"},"finish_reason":null}]}',
+        'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"答案"},"finish_reason":null}]}',
+        'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}}',
+        'data: [DONE]',
+    ]
+
+    all_events = []
+    for line in chunks:
+        result = conv.feed_line(line)
+        if result:
+            for evt_line in result.strip().split("\n\n"):
+                if evt_line.startswith("data: "):
+                    all_events.append(json.loads(evt_line[6:]))
+    for evt_line in conv.finish().strip().split("\n\n"):
+        if evt_line.startswith("data: "):
+            all_events.append(json.loads(evt_line[6:]))
+
+    types = [e["type"] for e in all_events]
+
+    # reasoning item 事件链齐全
+    for t in ("response.reasoning_summary_part.added", "response.reasoning_summary_text.delta",
+              "response.reasoning_summary_text.done", "response.reasoning_summary_part.done"):
+        assert t in types, t
+
+    # reasoning item 占 output_index 0，message 顺延为 1
+    r_added = [e for e in all_events if e["type"] == "response.output_item.added"
+               and e["item"]["type"] == "reasoning"][0]
+    assert r_added["output_index"] == 0 and r_added["item"]["summary"] == []
+    m_added = [e for e in all_events if e["type"] == "response.output_item.added"
+               and e["item"]["type"] == "message"][0]
+    assert m_added["output_index"] == 1
+
+    # summary delta 文本拼接完整，且带 item_id
+    deltas = [e for e in all_events if e["type"] == "response.reasoning_summary_text.delta"]
+    assert [d["delta"] for d in deltas] == ["先分析", "问题"]
+    assert all(d["item_id"] == r_added["item"]["id"] for d in deltas)
+
+    # completed 事件里 output 顺序：reasoning 在 message 前
+    completed = [e for e in all_events if e["type"] == "response.completed"][0]
+    out = completed["response"]["output"]
+    assert out[0]["type"] == "reasoning"
+    assert out[0]["summary"] == [{"type": "summary_text", "text": "先分析问题"}]
+    assert out[1]["type"] == "message" and out[1]["content"][0]["text"] == "答案"
+
+    # 非流式对象同样包含 reasoning item
+    nonstream = conv.get_nonstream_response()
+    assert nonstream["output"][0]["type"] == "reasoning"
+    print("✅ test_stream_reasoning_summary")
+
+
+def test_stream_reasoning_only():
+    """测试：只有思考没有正文时，输出仍是合法的 reasoning-only 响应。"""
+    conv = ResponsesStreamConverter(model="glm-5.2")
+    for line in [
+        'data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"纯思考"},"finish_reason":null}]}',
+        'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+    ]:
+        conv.feed_line(line)
+    finish = conv.finish()
+    completed = [json.loads(l[6:]) for l in finish.strip().split("\n\n")
+                 if l.startswith("data: ") and json.loads(l[6:])["type"] == "response.completed"][0]
+    out = completed["response"]["output"]
+    assert len(out) == 1 and out[0]["type"] == "reasoning"
+    assert out[0]["summary"][0]["text"] == "纯思考"
+    print("✅ test_stream_reasoning_only")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_array_input_request()
@@ -636,7 +730,10 @@ if __name__ == "__main__":
     test_tool_search_passthrough_request()
     test_tool_search_stream_roundtrip()
     test_namespace_function_call_roundtrip()
-    print(f"\n🎉 All {18} tests passed!")
+    test_reasoning_request_object()
+    test_stream_reasoning_summary()
+    test_stream_reasoning_only()
+    print(f"\n🎉 All {21} tests passed!")
 
 
 

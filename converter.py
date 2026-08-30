@@ -442,9 +442,10 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
 async def _collect_stream(response: httpx.Response) -> dict:
     """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
-    合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    合并所有 chunk 的 delta（content / reasoning_content / tool_calls），并取 usage / finish_reason。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     # tool_calls: index -> {id, name, arguments(分片拼接)}
     tool_calls: dict[int, dict] = {}
     model: str | None = None
@@ -471,6 +472,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
@@ -492,6 +495,9 @@ async def _collect_stream(response: httpx.Response) -> dict:
         finish_reason = finish_reason or "tool_calls"
 
     message = {"role": "assistant", "content": "".join(content_parts) or None}
+    # 后端思考输出（vLLM 风格 reasoning_content），有才带，兼容不认识的客户端
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
     if tcs:
         message["tool_calls"] = tcs
     return {
