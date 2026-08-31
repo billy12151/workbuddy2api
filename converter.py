@@ -518,12 +518,41 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
+def _strip_empty_tool_calls(line: bytes) -> bytes:
+    """剥掉 SSE data 行里 delta 的空 tool_calls 数组，其余行原样返回。
+
+    后端网关每个 chunk 都带 "tool_calls":[]（见 converter.log 原始 SSE）。ZCode 的
+    AI SDK 流解析把 delta.tool_calls != null 当「思考块结束」信号，空数组也命中，
+    会把每个 reasoning_content 增量拆成独立思考块（UI 一词一块）。空数组无语义，
+    JSON 解析后安全剔除；非 data 行或解析失败原样透传，不影响 SSE 帧。
+    """
+    if b'"tool_calls":[]' not in line or not line.startswith(b"data:"):
+        return line
+    try:
+        obj = json.loads(line[5:].strip())
+    except Exception:
+        return line
+    touched = False
+    for ch in obj.get("choices") or []:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta")
+        if isinstance(delta, dict) and delta.get("tool_calls") == []:
+            delta.pop("tool_calls", None)
+            touched = True
+    if not touched:
+        return line
+    return b"data: " + json.dumps(
+        obj, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = ""):
-    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
+    """把后端 SSE 转发给客户端（标准 OpenAI SSE，含 tool_calls；剥空 tool_calls 数组）。
 
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
-    完整原始 SSE 累积后落盘到日志（调试用）。
+    完整原始 SSE（后端原样）累积后落盘到日志（调试用）。
     """
     finish_reason = None
     tool_names: list[str] = []
@@ -531,6 +560,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     saw_filter = False
     buf = b""
     raw_parts: list[bytes] = []   # 累积完整原始 SSE
+    sse_buf = b""                 # 转发用行缓冲（按行剥空 tool_calls 后再发）
     prefix = f"[{rid}] " if rid else ""
 
     def _feed(chunk: bytes):
@@ -579,7 +609,15 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                     if chunk:
                         raw_parts.append(chunk)
                         _feed(chunk)
-                        yield chunk
+                        sse_buf += chunk
+                        if b"\n" not in sse_buf:
+                            continue
+                        lines = sse_buf.split(b"\n")
+                        sse_buf = lines.pop()  # 末段可能是不完整行，留待下一轮
+                        if lines:
+                            yield b"".join(_strip_empty_tool_calls(ln) + b"\n" for ln in lines)
+                if sse_buf:
+                    yield _strip_empty_tool_calls(sse_buf)
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
