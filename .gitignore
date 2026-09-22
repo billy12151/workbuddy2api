@@ -22,3 +22,7 @@ Thumbs.db
 *.key
 secrets.*
 
+
+# workbuddy2api 钥匙抓取中间产物
+wbkey/last_push.json
+wbkey/grab_key.log

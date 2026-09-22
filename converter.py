@@ -100,10 +100,36 @@ class CredentialManager:
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._mtime: float = 0.0
+        self._atrest_keys: dict | None = None
+        # 刷新后的 token 落本地缓存（应用 auth 文件 5.6.2 起是加密格式，不能回写）
+        self._cache_path = Path(__file__).resolve().parent / "secrets.token-cache.json"
 
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            doc = json.load(f)
+        # WorkBuddy 5.6.2 起 auth 文件敏感字段是 $wbEncrypted 信封，读时解密
+        try:
+            from wbkey.atrest import load_keys, unwrap_doc
+            if self._atrest_keys is None:
+                self._atrest_keys = load_keys()
+            unwrap_doc(doc, self._atrest_keys)
+        except FileNotFoundError:
+            if "$wbEncrypted" in json.dumps(doc)[:200000]:
+                print("[warn] auth 文件含加密字段但找不到 wbkey 钥匙文件，"
+                      "运行 wbkey/grab_key.py 抓取后重启本服务", flush=True)
+        except RuntimeError:
+            # 钥匙可能刚被 grab_key.py 重新抓取，热重载一次再试
+            from wbkey.atrest import load_keys
+            self._atrest_keys = load_keys()
+            unwrap_doc(doc, self._atrest_keys)
+        return doc
+
+    def _load_cache(self) -> dict | None:
+        try:
+            with open(self._cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     def _load_if_stale(self):
         """若文件 mtime 变了（外部刷新过），重新加载缓存。"""
@@ -114,6 +140,12 @@ class CredentialManager:
         if self._cached is None or mt != self._mtime:
             self._cached = self._read_raw()
             self._mtime = mt
+            # 本地缓存里刷新过的 token 比文件里的新则优先（文件不会包含代理刷的 token）
+            cached = self._load_cache() or {}
+            cached_auth = cached.get("auth") or {}
+            file_auth = self._cached.get("auth") or {}
+            if cached_auth.get("lastRefreshTime", 0) > file_auth.get("lastRefreshTime", 0):
+                self._cached["auth"] = cached_auth
 
     def _session(self) -> dict:
         self._load_if_stale()
@@ -153,11 +185,15 @@ class CredentialManager:
         if not new_auth.get("refreshExpiresAt") and new_auth.get("refreshExpiresIn"):
             new_auth["refreshExpiresAt"] = int(time.time() * 1000) + new_auth["refreshExpiresIn"] * 1000
         s["auth"] = new_auth
-        # 原子写回
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+        # 5.6.2 起应用 auth 文件是加密格式，不能回写；刷新结果写本地缓存（0600）
+        try:
+            tmp = self._cache_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"auth": new_auth}, f, ensure_ascii=False, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._cache_path)
+        except OSError as e:
+            print(f"[warn] token 缓存写盘失败: {e}", flush=True)
         self._cached = s
         self._mtime = self.path.stat().st_mtime
 
