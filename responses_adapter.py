@@ -62,7 +62,12 @@ def responses_request_to_chat(body: dict) -> dict:
     if tools:
         chat["tools"] = _convert_tools_for_chat(tools)
     if "tool_choice" in body:
-        chat["tool_choice"] = body["tool_choice"]
+        # 规范化为后端接受的字符串（对象形式会 400 code=11101，同 anthropic 侧）；
+        # 延迟导入避免与 converter 循环依赖
+        from converter import _normalize_tool_choice
+        tc_norm = _normalize_tool_choice(body["tool_choice"])
+        if tc_norm is not None:
+            chat["tool_choice"] = tc_norm
 
     # reasoning: {effort, summary} → reasoning_effort
     # Codex 配置 model_reasoning_effort 后在 Responses 请求里发对象形式，Chat 后端只认档位字符串

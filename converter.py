@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -345,6 +345,43 @@ def list_models(authorization: Optional[str] = Header(default=None),
     return {"object": "list", "data": data}
 
 
+def _normalize_tool_choice(tc: Any) -> Any:
+    """把 tool_choice 规范化为后端接受的字符串（无 tool_choice 返回 None）。
+
+    后端 Go 结构体 tool_choice 是 string，对象形式必 400（code=11101，
+    "cannot unmarshal object into Go struct field Request.tool_choice of type
+    string"，2026-09-26 实测）。实测字符串接受 "auto"/"required"/"none"。
+    强制指定具体函数（{"type":"function"/"tool"} 或裸函数名）后端无对应
+    字符串表达，降级为 "required"；未知值原样透传也是 400，同样降级。
+    """
+    if tc is None:
+        return None
+    if isinstance(tc, dict):
+        return {"auto": "auto", "none": "none"}.get(tc.get("type"), "required")
+    if isinstance(tc, str) and tc in ("none", "auto", "required"):
+        return tc
+    return "required"
+
+
+def _anthropic_upstream_error(raw: bytes, status: int) -> JSONResponse:
+    """把上游非 200 响应包装为 Anthropic 协议错误体 + 真实状态码。
+
+    Anthropic SDK 按 {"type":"error","error":{...}} 解析，Claude Desktop
+    能直接看到后端真实错误（如 11101 的参数详情），而不是被 200 空流
+    包装出来的 "empty or malformed response"。
+    """
+    text = raw.decode("utf-8", "replace")
+    try:
+        j = json.loads(text)
+        msg = str(j.get("msg") or j.get("message") or text)
+    except Exception:
+        msg = text
+    return JSONResponse(
+        status_code=status,
+        content={"type": "error", "error": {"type": "api_error", "message": msg[:500]}},
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request,
                            authorization: Optional[str] = Header(default=None),
@@ -371,6 +408,12 @@ async def chat_completions(request: Request,
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
+    # tool_choice 规范化：后端只接受字符串，对象/裸函数名会 400（code=11101）
+    tc_norm = _normalize_tool_choice(body.get("tool_choice"))
+    if tc_norm is None:
+        body.pop("tool_choice", None)
+    else:
+        body["tool_choice"] = tc_norm
 
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
@@ -935,41 +978,79 @@ async def create_message(request: Request,
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
+    # 客户端要非流式（Anthropic Messages 默认 stream=false）→ 聚合为单个 JSON 响应；
+    # 要流式 → 先预检上游状态码再开流。此前无论 200 与否都包成 event-stream，
+    # 上游 400（如 tool_choice 对象触发 11101）被 Claude Desktop 看成
+    # "empty or malformed response (HTTP 200)"，真因被完全掩盖。
+    if not payload.get("stream"):
+        conv = AnthropicStreamConverter(model=model_name)
+        saw_events = False
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                async with c.stream("POST", url, headers=headers, json=chat_body) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+                        _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
+                        return _anthropic_upstream_error(raw, r.status_code)
+                    async for line in r.aiter_lines():
+                        if conv.feed_line(line):
+                            saw_events = True
+        except httpx.HTTPError as e:
+            _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
+            return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}})
+        if not saw_events:
+            _log(f"[{rid}] ⚠️ 非流式收到 0 个上游事件 | {model_name}")
+        elapsed = time.time() - t0 if t0 else 0
+        # 读转换器内部状态用于完成日志
+        _log(f"[{rid}] ◀ ANTHROPIC {model_name} | {elapsed:.1f}s | nonstream done | stop={conv._finish_reason}")
+        return JSONResponse(content=conv.get_nonstream_response())
+
+    client = httpx.AsyncClient(timeout=None)
+    try:
+        r = await client.send(client.build_request("POST", url, headers=headers, json=chat_body), stream=True)
+    except httpx.HTTPError as e:
+        await client.aclose()
+        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
+        return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}})
+    if r.status_code != 200:
+        err = await r.aread()
+        await r.aclose()
+        await client.aclose()
+        _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
+        _log(f"[{rid}] ── ERROR BODY ──\n{err.decode('utf-8','replace')}")
+        return _anthropic_upstream_error(err, r.status_code)
     return StreamingResponse(
-        _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+        _relay_anthropic(client, r, model_name, t0, rid),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-async def _stream_anthropic(url: str, headers: dict, body: dict,
-                            model_name: str = "?", t0: float = 0.0, rid: str = ""):
-    """消费后端 OpenAI Chat SSE，实时转换为 Anthropic Messages SSE 事件流。"""
+async def _relay_anthropic(client: httpx.AsyncClient, r: httpx.Response,
+                           model_name: str = "?", t0: float = 0.0, rid: str = ""):
+    """把调用方已建立的 200 上游流转换为 Anthropic Messages SSE 转发给客户端。
+
+    非 200 的上游响应在路由里预检时已用真实状态码报错，这里只消费 200 流；
+    流中途断连仍以 Anthropic error 事件收尾（此时响应头已发出，改不了状态码）。
+    """
     converter = AnthropicStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
-
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    error_evt = {"type": "error", "error": {"message": err.decode('utf-8','replace')[:500], "type": "api_error", "code": r.status_code}}
-                    yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
-                    return
-                async for line in r.aiter_lines():
-                    events = converter.feed_line(line)
-                    if events:
-                        yield events.encode("utf-8")
+        async for line in r.aiter_lines():
+            events = converter.feed_line(line)
+            if events:
+                yield events.encode("utf-8")
+        finish_events = converter.finish()
+        if finish_events:
+            yield finish_events.encode("utf-8")
     except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+        _log(f"{prefix}✗ 网络错误(流中) | {model_name} | {e}")
         error_evt = {"type": "error", "error": {"message": str(e)[:500], "type": "api_error", "code": 502}}
         yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
-        return
-
-    finish_events = converter.finish()
-    if finish_events:
-        yield finish_events.encode("utf-8")
+    finally:
+        await r.aclose()
+        await client.aclose()
 
     elapsed = time.time() - t0 if t0 else 0
     _log(f"{prefix}◀ ANTHROPIC {model_name} | {elapsed:.1f}s | stream done")

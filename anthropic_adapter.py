@@ -68,12 +68,18 @@ def anthropic_request_to_chat(body: dict) -> dict:
     if tools:
         chat["tools"] = _convert_anthropic_tools(tools)
 
+    # tool_choice：后端只接受字符串。对象形式会被 400（code=11101 "cannot unmarshal
+    # object into Go struct field Request.tool_choice of type string"，2026-09-26 实测，
+    # Claude Desktop 的 web search 等工具流即栽在这里）。实测后端接受 "auto"/"required"/"none"。
+    # Anthropic dict 映射：auto→auto，any→required，none→none；
+    # {"type":"tool","name":X} 后端无强制指定单个函数的字符串表达，降级为 required。
     if "tool_choice" in body:
         tc = body["tool_choice"]
         if isinstance(tc, dict):
-            chat["tool_choice"] = {"type": tc.get("type", "any"), "function": {"name": tc.get("name", "")}}
+            tc_type = tc.get("type", "any")
+            chat["tool_choice"] = {"auto": "auto", "any": "required", "tool": "required", "none": "none"}.get(tc_type, "auto")
         elif isinstance(tc, str):
-            chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
+            chat["tool_choice"] = tc if tc in ("none", "auto", "required") else "required"
 
     # thinking → reasoning_effort（后端思考开关）
     # Anthropic 用 budget_tokens 表思考预算，后端只认 OpenAI 风格档位字符串；

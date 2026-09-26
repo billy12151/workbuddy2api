@@ -508,6 +508,56 @@ def test_nonstream_thinking_block():
     print("✅ test_nonstream_thinking_block")
 
 
+def test_tool_choice_dict_mapping():
+    """测试：Anthropic dict 形式 tool_choice 映射为后端接受的字符串。
+
+    后端 Go 结构体 tool_choice 是 string，对象形式必 400（code=11101）。
+    Claude Desktop 的 web search 等工具流会发 {"type":"auto",...}。
+    """
+    base = {"model": "glm-5.3", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    # auto（Claude Desktop 实际发的形态，可带 disable_parallel_tool_use）
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "auto", "disable_parallel_tool_use": False}})
+    assert chat["tool_choice"] == "auto", chat["tool_choice"]
+
+    # any → required（强制调用某个工具）
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "any"}})
+    assert chat["tool_choice"] == "required", chat["tool_choice"]
+
+    # tool 强制指定具体函数 → 后端无字符串表达，降级 required
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "tool", "name": "web_search"}})
+    assert chat["tool_choice"] == "required", chat["tool_choice"]
+
+    # none
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "none"}})
+    assert chat["tool_choice"] == "none", chat["tool_choice"]
+
+    # 未知 type → auto 兜底（不再产出对象）
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "mystery"}})
+    assert chat["tool_choice"] == "auto", chat["tool_choice"]
+    print("✅ test_tool_choice_dict_mapping")
+
+
+def test_tool_choice_string_passthrough():
+    """测试：字符串 tool_choice 合法值透传、裸函数名降级 required。"""
+    base = {"model": "glm-5.3", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    for tc in ("auto", "none", "required"):
+        chat = anthropic_request_to_chat({**base, "tool_choice": tc})
+        assert chat["tool_choice"] == tc, chat["tool_choice"]
+
+    # 裸函数名（OpenAI 风格遗留）→ 原实现产出对象必 400，现降级 required
+    chat = anthropic_request_to_chat({**base, "tool_choice": "get_weather"})
+    assert chat["tool_choice"] == "required", chat["tool_choice"]
+
+    # 无 tool_choice → 不产出该键
+    chat = anthropic_request_to_chat(base)
+    assert "tool_choice" not in chat
+    print("✅ test_tool_choice_string_passthrough")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_system_array()
@@ -525,4 +575,6 @@ if __name__ == "__main__":
     test_thinking_request_mapping()
     test_stream_thinking_delta()
     test_nonstream_thinking_block()
-    print(f"\n🎉 All {16} tests passed!")
+    test_tool_choice_dict_mapping()
+    test_tool_choice_string_passthrough()
+    print(f"\n🎉 All {18} tests passed!")
