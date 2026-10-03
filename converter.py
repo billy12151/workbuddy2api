@@ -10,11 +10,20 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
     ②在本地 /v1/* 与后端 /v2/* 之间做路径映射与透传（含 Anthropic / Chat / Responses 三种协议）。
   - token 过期时自动调 `/v2/plugin/auth/token/refresh` 刷新，并回写 auth 文件。
 
+双变体：同一份代码支持国内版与国际版两个独立网关实例。
+  - cn   （默认）：WorkBuddy 国内版，后端 copilot.tencent.com，凭据
+    workbuddy-desktop.info，默认端口 8787。
+  - intl：WorkBuddy AI 国际版，后端 www.workbuddy.ai，凭据
+    workbuddy-desktop-ai.info，默认端口 8788。国际版后端额外要求
+    首条消息必须是 system prompt（转换器自动注入）。
+  两版凭据文件同目录共存，按文件名精确区分；模型列表各自独立。
+
 跨平台：自动定位 auth 目录（macOS / Windows / Linux）。
 依赖：fastapi + uvicorn + httpx（pip install fastapi "uvicorn[standard]" httpx）。
 
 用法：
-  python3 converter.py                       # 默认 127.0.0.1:8787
+  python3 converter.py                       # 国内版，默认 127.0.0.1:8787
+  python3 converter.py --variant intl        # 国际版，默认 127.0.0.1:8788
   python3 converter.py --port 9000
   python3 converter.py --api-key mysecret    # 启用客户端鉴权
 """
@@ -54,11 +63,90 @@ from anthropic_adapter import (
 )
 
 # ---------------------------------------------------------------------------
-# 常量
+# 变体（国内版 / 国际版）：同一份代码跑两个独立网关实例。
+# 两版协议同构（/v2/chat/completions、Bearer + X-User-Id），差异在后端域名、
+# 凭据文件名、模型列表、以及国际版后端要求首条消息必须是 system。
 # ---------------------------------------------------------------------------
 
-BACKEND = "https://copilot.tencent.com"
-DEFAULT_DOMAIN = "www.codebuddy.cn"
+CN_MODELS = [
+    "glm-5.2", "glm-5.1", "glm-5v-turbo",
+    "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
+    "deepseek-v4-pro", "deepseek-v4-flash",
+    "minimax-m3-pay", "hy3-preview-agent", "hy4-preview", "auto",
+]
+
+# 国内版模型名映射：Codex 内部功能可能用默认模型名，映射到对应后端模型
+CN_MODEL_NAME_MAP = {
+    "gpt-5.6-luna": "hy3",
+    "gpt-5.6-sol": "hy3",
+    "gpt-5.5": "hy3",
+    "gpt-5": "hy3",
+    "gpt-4o": "hy3",
+    "gpt-4": "hy3",
+    # hy4 预览版别名（Codex 内部默认模型名 -> 后端 hy4-preview）
+    "gpt-5.6": "hy4-preview",
+    "gpt-6": "hy4-preview",
+    "gpt-6-mini": "hy4-preview",
+}
+
+# 国际版（WorkBuddy AI，www.workbuddy.ai）模型列表：
+# 取自其产品配置 ~/.workbuddy-ai/cache/acc-product-config-v3.json（2026-10 快照），
+# 去掉 UI 选择器别名（default-model/fast-model/...，后端也接受，可直传）
+# 与图像/视频生成模型（gpt-image-2.5-sunburst、seedance-2.5）。
+# 国际版 gpt-* 是真实模型，不做国内版那套 gpt→hy 名字映射。
+INTL_MODELS = [
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+    "gemini-3.8-flash", "gemini-3.5-flash",
+    "grok-4.7", "kimi-k2.8-preview", "kimi-k3", "kimi-k2.6",
+    "glm-5.3", "glm-5.3-flash", "glm-5.2",
+    "deepseek-v4.1-flash", "deepseek-v4.1-flash-sg",
+    "hy3", "hy4-preview", "hy4-preview-f",
+    "auto",
+]
+
+VARIANTS = {
+    "cn": {
+        "backend": "https://copilot.tencent.com",
+        "domain": "www.codebuddy.cn",
+        "auth_filename": "workbuddy-desktop.info",    # 国内版 WorkBuddy
+        "models": CN_MODELS,
+        "model_map": CN_MODEL_NAME_MAP,
+        "token_cache": "secrets.token-cache.json",
+        "require_system_first": False,
+    },
+    "intl": {
+        "backend": "https://www.workbuddy.ai",
+        "domain": "www.workbuddy.ai",
+        "auth_filename": "workbuddy-desktop-ai.info",  # 国际版 WorkBuddy AI
+        "models": INTL_MODELS,
+        "model_map": {},
+        "token_cache": "secrets.token-cache-intl.json",
+        # 国际版后端强制首条消息必须是 system prompt，否则 400 code=11128
+        "require_system_first": True,
+    },
+}
+
+
+def apply_variant(name: str):
+    """按变体设置模块级配置（import 时取 WB_VARIANT 环境变量，main() 可用
+    --variant 覆盖；handler 在调用时读取这些全局量）。"""
+    global VARIANT, BACKEND, DEFAULT_DOMAIN, AUTH_FILENAME
+    global DEFAULT_MODELS, MODEL_NAME_MAP, REQUIRE_SYSTEM_FIRST
+    if name not in VARIANTS:
+        raise ValueError(f"未知变体: {name}（可选: {', '.join(VARIANTS)}）")
+    v = VARIANTS[name]
+    VARIANT = name
+    BACKEND = v["backend"]
+    DEFAULT_DOMAIN = v["domain"]
+    AUTH_FILENAME = v["auth_filename"]
+    DEFAULT_MODELS = v["models"]
+    MODEL_NAME_MAP = v["model_map"]
+    REQUIRE_SYSTEM_FIRST = v["require_system_first"]
+
+
+apply_variant(os.environ.get("WB_VARIANT", "cn"))
+
 USER_AGENT = "codebuddy2openai/2.0"
 
 # ---------------------------------------------------------------------------
@@ -81,10 +169,16 @@ def auth_dirs() -> list[Path]:
 
 
 def find_auth_file() -> Path | None:
+    """按变体精确匹配凭据文件名。
+
+    auth 目录里国内版/国际版文件共存（workbuddy-desktop.info /
+    workbuddy-desktop-ai.info），不能通配取第一个——字母序 ai 文件在前，
+    国内版网关会错拿国际版凭据。
+    """
     for d in auth_dirs():
-        if d.is_dir():
-            for f in sorted(d.glob("*.info")):
-                return f
+        exact = d / AUTH_FILENAME
+        if exact.is_file():
+            return exact
     return None
 
 
@@ -101,8 +195,9 @@ class CredentialManager:
         self._cached: dict | None = None
         self._mtime: float = 0.0
         self._atrest_keys: dict | None = None
-        # 刷新后的 token 落本地缓存（应用 auth 文件 5.6.2 起是加密格式，不能回写）
-        self._cache_path = Path(__file__).resolve().parent / "secrets.token-cache.json"
+        # 刷新后的 token 落本地缓存（应用 auth 文件 5.6.2 起是加密格式，不能回写）。
+        # 缓存文件按变体区分，避免两个网关实例互相覆盖刷新结果。
+        self._cache_path = Path(__file__).resolve().parent / VARIANTS[VARIANT]["token_cache"]
 
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
@@ -234,29 +329,8 @@ class CredentialManager:
 
 
 # ---------------------------------------------------------------------------
-# 模型列表
+# 模型列表：DEFAULT_MODELS / MODEL_NAME_MAP 已上移到 VARIANTS（按变体区分）
 # ---------------------------------------------------------------------------
-
-DEFAULT_MODELS = [
-    "glm-5.2", "glm-5.1", "glm-5v-turbo",
-    "kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
-    "deepseek-v4-pro", "deepseek-v4-flash",
-    "minimax-m3-pay", "hy3-preview-agent", "hy4-preview", "auto",
-]
-
-# 模型名映射：Codex 内部功能可能用默认模型名，映射到对应后端模型
-MODEL_NAME_MAP = {
-    "gpt-5.6-luna": "hy3",
-    "gpt-5.6-sol": "hy3",
-    "gpt-5.5": "hy3",
-    "gpt-5": "hy3",
-    "gpt-4o": "hy3",
-    "gpt-4": "hy3",
-    # hy4 预览版别名（Codex 内部默认模型名 -> 后端 hy4-preview）
-    "gpt-5.6": "hy4-preview",
-    "gpt-6": "hy4-preview",
-    "gpt-6-mini": "hy4-preview",
-}
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
 PASSTHROUGH_BODY_KEYS = {
@@ -327,6 +401,7 @@ def _cred() -> CredentialManager:
 def health():
     cred = CONFIG["cred"]
     info: dict = {"status": "ok", "platform": sys.platform, "python": sys.version.split()[0],
+                  "variant": VARIANT, "backend": BACKEND,
                   "auth_file": str(find_auth_file() or "(未找到)"), "mode": "direct-proxy (native function calling)"}
     if cred is not None:
         try:
@@ -453,6 +528,9 @@ async def chat_completions(request: Request,
     # 完整请求体（发往后端的实际内容；若启用脱敏，这里已是脱敏后）
     _log(f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}")
 
+    if REQUIRE_SYSTEM_FIRST:
+        _ensure_system_first(body)
+
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
@@ -481,6 +559,16 @@ async def chat_completions(request: Request,
         raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
+
+
+def _ensure_system_first(body: dict):
+    """国际版后端要求首条消息必须是 system prompt（否则 400 code=11128
+    "first message is not system prompt"）。客户端没给时注入一条通用提示。"""
+    msgs = body.get("messages") or []
+    if not msgs or msgs[0].get("role") != "system":
+        body["messages"] = [{"role": "system",
+                             "content": "You are a helpful assistant."}] + msgs
+        _log("[filter] 注入首条 system 消息（国际版后端要求）")
 
 
 def _last_user_text(messages: list) -> str:
@@ -835,6 +923,9 @@ async def create_response(request: Request,
     )
     _log(f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
 
+    if REQUIRE_SYSTEM_FIRST:
+        _ensure_system_first(chat_body)
+
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
@@ -974,6 +1065,9 @@ async def create_message(request: Request,
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     _log(f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
 
+    if REQUIRE_SYSTEM_FIRST:
+        _ensure_system_first(chat_body)
+
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
@@ -1073,18 +1167,21 @@ async def count_tokens(request: Request,
 # 启动
 # ---------------------------------------------------------------------------
 
-def preflight() -> bool:
-    af = find_auth_file()
+def preflight(af: Path | None = None) -> bool:
+    if af is None:
+        af = find_auth_file()
     sys.stderr.write("==== 预检 ====\n")
     sys.stderr.write(f"平台      : {sys.platform}\n")
     sys.stderr.write(f"Python    : {sys.version.split()[0]}\n")
+    sys.stderr.write(f"变体      : {VARIANT}（{'国际版 WorkBuddy AI' if VARIANT == 'intl' else '国内版 WorkBuddy'}）\n")
     sys.stderr.write(f"后端      : {BACKEND} (直连，原生 function calling)\n")
     sys.stderr.write(f"登录文件  : {af or '(未找到)'}\n")
     if auth_dirs():
-        sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
+        sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}（找 {AUTH_FILENAME}）\n")
     ok = True
     if af is None:
-        sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy）。\n")
+        hint = "WorkBuddy AI" if VARIANT == "intl" else "CodeBuddy/WorkBuddy"
+        sys.stderr.write(f"\n[警告] 未找到登录文件。请在桌面端完成登录（{hint}）。\n")
         ok = False
     else:
         try:
@@ -1101,8 +1198,18 @@ def preflight() -> bool:
 
 def main():
     ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器（直连后端）")
+    ap.add_argument("--variant", choices=list(VARIANTS),
+                    default=os.environ.get("WB_VARIANT", "cn"),
+                    help="网关变体：cn=国内版 WorkBuddy（默认，端口 8787），"
+                         "intl=国际版 WorkBuddy AI（默认端口 8788）。"
+                         "两版可各起一个实例同时运行。")
+    ap.add_argument("--backend", default=None, metavar="URL",
+                    help="覆盖变体默认后端地址（一般不需要）")
+    ap.add_argument("--auth-file", default=None, metavar="PATH",
+                    help="覆盖变体默认凭据文件路径（一般不需要）")
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--port", type=int, default=None,
+                    help="监听端口（默认：cn=8787, intl=8788）")
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
                     help="可选：要求客户端携带的 API key（默认不校验）")
     ap.add_argument("--log", default=None, metavar="PATH",
@@ -1123,13 +1230,20 @@ def main():
     CONFIG["no_compact"] = args.no_compact
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
-    af = find_auth_file()
+
+    global BACKEND
+    apply_variant(args.variant)
+    if args.backend:
+        BACKEND = args.backend
+    port = args.port if args.port is not None else (8788 if VARIANT == "intl" else 8787)
+
+    af = Path(args.auth_file) if args.auth_file else find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 
     if not args.skip_check:
-        preflight()
+        preflight(af)
 
-    sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
+    sys.stderr.write(f"\n✅ 监听 http://{args.host}:{port}（{VARIANT} 变体，直连后端，原生 function calling）\n")
     sys.stderr.write("   GET  /v1/models\n")
     sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
     sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
@@ -1147,7 +1261,7 @@ def main():
     # 启动时写一条标记
     _log(f"==== converter 启动 ====")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

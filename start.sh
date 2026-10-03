@@ -4,8 +4,9 @@
 
 cd "$(dirname "$0")"
 
-# 杀掉旧进程
-pkill -f "converter.py" 2>/dev/null
+# 杀掉旧进程（只杀国内版实例，国际版网关由 start-intl.sh 管理）
+pkill -f "converter.py --desensitize" 2>/dev/null
+pkill -f "converter.py --variant cn" 2>/dev/null
 sleep 1
 
 # 启动
@@ -21,7 +22,7 @@ source .venv/bin/activate
 # 所以先清池再触发一个任务会话。抓到前先启动服务也没关系——converter
 # 支持钥匙热重载，后台抓到后下一个请求自动生效。
 # ---------------------------------------------------------------------------
-KEY_CHECK=$(.venv/bin/python3 wbkey/check_key.py 2>/dev/null)
+KEY_CHECK=$(.venv/bin/python3 wbkey/check_key.py workbuddy-desktop.info 2>/dev/null)
 if [ "$KEY_CHECK" != "ok" ] && [ "$KEY_CHECK" != "plaintext-auth" ] && [ "$KEY_CHECK" != "no-auth-file" ]; then
     echo "🔑 钥匙缺失或不匹配（$KEY_CHECK），自动重抓..."
     rm -f secrets.atrest.json
@@ -45,7 +46,7 @@ if [ "$KEY_CHECK" != "ok" ] && [ "$KEY_CHECK" != "plaintext-auth" ] && [ "$KEY_C
     fi
 fi
 
-nohup python converter.py --desensitize --api-key "" --log converter.log > /dev/null 2>&1 &
+nohup python converter.py --variant cn --desensitize --api-key "" --log converter.log > /dev/null 2>&1 &
 PID=$!
 sleep 2
 

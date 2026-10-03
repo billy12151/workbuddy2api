@@ -106,6 +106,33 @@ python3 converter.py --desensitize --log converter.log
 
 看到监听 `http://127.0.0.1:8787` 就说明已经起来了。
 
+### 3a. 国际版网关（WorkBuddy AI）
+
+WorkBuddy AI（国际版，`www.workbuddy.ai`）与国内版协议同构，可各自起一个
+独立网关同时运行。国际版默认端口 **8788**，模型列表与国内版不同
+（gpt-6 / gemini-3.8-flash / grok-4.7 / kimi-k3 / glm-5.3 等）：
+
+```bash
+bash start-intl.sh                # 一键启动（含钥匙自检），端口 8788
+# 或手动：
+python3 converter.py --variant intl --desensitize --log converter-intl.log
+```
+
+```bash
+curl http://127.0.0.1:8788/health
+curl http://127.0.0.1:8788/v1/models
+```
+
+差异说明：
+
+- 凭据文件按变体精确区分：国内版 `workbuddy-desktop.info`、国际版
+  `workbuddy-desktop-ai.info`（同目录共存，不会错拿）；token 刷新缓存也各自独立。
+- 国际版后端要求首条消息必须是 system prompt（否则 400 code=11128），
+  网关会自动注入，客户端无感。
+- 国际版 gpt-\* 是真实模型，不做国内版那套 gpt→hy 名字映射。
+- 两版共用同一把 at-rest 解密钥匙（`secrets.atrest.json`），任一 app
+  抓到的钥匙对两版通用。
+
 ### 4. 快速自检
 
 ```bash

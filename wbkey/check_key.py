@@ -17,6 +17,13 @@ from atrest import load_keys  # noqa: E402
 def find_auth_file():
     base = os.path.expanduser(
         "~/Library/Application Support/CodeBuddyExtension/Data/Public/auth")
+    # 国内版/国际版凭据文件同目录共存，按需精确指定：
+    #   check_key.py                          -> 取字母序第一个（兼容旧行为）
+    #   check_key.py workbuddy-desktop-ai.info -> 检查国际版文件
+    prefer = sys.argv[1] if len(sys.argv) > 1 else None
+    if prefer:
+        p = os.path.join(base, prefer)
+        return p if os.path.exists(p) else None
     for f in sorted(glob.glob(os.path.join(base, "*.info"))):
         return f
     return None
