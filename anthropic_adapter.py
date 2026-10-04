@@ -154,8 +154,11 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                         b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
                     )
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
+        # 注意顺序：tool 消息必须紧跟上一条 assistant 的 tool_calls（OpenAI 协议
+        # 要求，DeepSeek 等供应商对 user 插在中间会 400 code=11133），
+        # 用户文本块放在 tool 结果之后。
         if text_parts:
-            result.insert(0, {"role": "user", "content": "".join(text_parts)})
+            result.append({"role": "user", "content": "".join(text_parts)})
         return result
 
     # assistant 角色

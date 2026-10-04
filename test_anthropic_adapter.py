@@ -160,7 +160,9 @@ def test_tool_result():
 
 
 def test_tool_result_with_user_text():
-    """测试：同一 user 消息包含 text + tool_result。"""
+    """同一 user 消息包含 text + tool_result：tool 必须在前（紧跟上一条
+    assistant 的 tool_calls），user 文本在后——OpenAI 协议要求，否则
+    DeepSeek 等供应商 400 code=11133（Claude Desktop 实测踩坑）。"""
     req = {
         "model": "auto",
         "max_tokens": 4096,
@@ -181,10 +183,10 @@ def test_tool_result_with_user_text():
     chat = anthropic_request_to_chat(req)
     msgs = chat["messages"]
 
-    assert msgs[0]["role"] == "user"
-    assert msgs[0]["content"] == "Continue."
-    assert msgs[1]["role"] == "tool"
-    assert msgs[1]["tool_call_id"] == "toolu_xyz"
+    assert msgs[0]["role"] == "tool"
+    assert msgs[0]["tool_call_id"] == "toolu_xyz"
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"] == "Continue."
     print("✅ test_tool_result_with_user_text")
 
 
