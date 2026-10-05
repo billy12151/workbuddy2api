@@ -31,6 +31,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -263,7 +264,7 @@ class CredentialManager:
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
         try:
-            with httpx.Client(timeout=15) as c:
+            with httpx.Client(timeout=15, trust_env=_trust_env()) as c:
                 r = c.post(url, headers=headers, json={})
             data = r.json()
         except Exception as e:
@@ -342,6 +343,17 @@ PASSTHROUGH_BODY_KEYS = {
 }
 
 # ---------------------------------------------------------------------------
+def _trust_env() -> bool:
+    """httpx 是否读环境/系统代理。默认 False（直连后端）。
+
+    macOS 上 urllib 的 getproxies() 会读系统代理，clash 常开系统代理时
+    httpx 默认把后端流量全绕道 127.0.0.1:6789——intl 链路抖动（成小时级
+    爆发的"网络错误"）即源于此，直连实测稳定。需要代理的环境设
+    WB_TRUST_ENV=1 退出直连。
+    """
+    return os.environ.get("WB_TRUST_ENV") == "1"
+
+
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 
@@ -536,27 +548,45 @@ async def chat_completions(request: Request,
     t0 = time.time()
 
     if client_wants_stream:
+        # 预检上游（含连接阶段网络错误重试）后再开流：非 200 用真实状态码报错，
+        # 而不是包成 200 + SSE 错误事件让客户端看到空流
+        try:
+            client, r, first, chunk_iter = await _open_upstream(url, headers, body, rid=rid, model_name=model_name)
+        except httpx.HTTPError as e:
+            _log(f"[{rid}] ✗ 网络错误(重试耗尽) | {model_name} | {e!r}")
+            raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e!r}", "type": "upstream_error"}})
+        if r.status_code != 200:
+            err = await r.aread()
+            await r.aclose()
+            await client.aclose()
+            _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
+            _log(f"[{rid}] ── ERROR BODY ──\n{err.decode('utf-8','replace')}")
+            raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(err, r.status_code))
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid),
+            _relay_chat(client, r, chunk_iter, first, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        async with httpx.AsyncClient(timeout=300) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    raw = await r.aread()
-                    _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-                    _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
-                    raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
-                collected = await _collect_stream(r)
-    except HTTPException:
-        raise
+        client, r, _, _ = await _open_upstream(url, headers, body, rid=rid, model_name=model_name, first_byte=False)
     except httpx.HTTPError as e:
-        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
-        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+        _log(f"[{rid}] ✗ 网络错误(重试耗尽) | {model_name} | {e!r}")
+        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e!r}", "type": "upstream_error"}})
+    try:
+        if r.status_code != 200:
+            raw = await r.aread()
+            _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+            _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
+            raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
+        collected = await _collect_stream(r)
+    except httpx.HTTPError as e:
+        _log(f"[{rid}] ✗ 网络错误(聚合中) | {model_name} | {e!r}")
+        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e!r}", "type": "upstream_error"}})
+    finally:
+        await r.aclose()
+        await client.aclose()
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -714,19 +744,70 @@ def _strip_empty_tool_calls(line: bytes) -> bytes:
     ).encode("utf-8")
 
 
-async def _stream_upstream(url: str, headers: dict, body: dict,
-                           model_name: str = "?", t0: float = 0.0, rid: str = ""):
-    """把后端 SSE 转发给客户端（标准 OpenAI SSE，含 tool_calls；剥空 tool_calls 数组）。
+async def _open_upstream(url: str, headers: dict, body: dict, *, rid: str = "", model_name: str = "?",
+                         attempts: int = 3, first_byte: bool = True):
+    """建立上游流式连接并预检，吞掉建立阶段的瞬时网络抖动。
 
+    重试窗口：连接失败、HTTP 502/503/504、"200 但首个 body 字节到来前断连"
+    （2026-10-05 WorkBuddy 桌面端 -32603 的实际形态：1.1s 处 0 字节被掐断）。
+    这些阶段尚未向客户端吐出任何字节，重试安全。429/4xx 不重试（确定性错误
+    或需客户端退避，SDK 自会处理）。
+
+    返回 (client, r, first_chunk, chunk_iter)：r 为 200 时 first/chunk_iter 已就绪
+    （first_byte=False 则两者为 None），调用方转发完 first 后继续消费 chunk_iter；
+    r 非 200 时由调用方按协议包装错误。重试耗尽仍网络失败抛最后一次 httpx.HTTPError。
+    connect 固定 10s 超时防黑洞挂死；读写不设超时（长生成不能被掐）。
+    """
+    prefix = f"[{rid}] " if rid else ""
+    last_exc: httpx.HTTPError | None = None
+    for attempt in range(1, attempts + 1):
+        client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0), trust_env=_trust_env())
+        r: httpx.Response | None = None
+        try:
+            r = await client.send(client.build_request("POST", url, headers=headers, json=body), stream=True)
+            if r.status_code in (502, 503, 504) and attempt < attempts:
+                raw = await r.aread()
+                _log(f"{prefix}✗ HTTP {r.status_code}({attempt}/{attempts},重试) | {model_name} | {_truncate(raw.decode('utf-8','replace'),120)}")
+                await r.aclose()
+                await client.aclose()
+                await asyncio.sleep(1)
+                continue
+            first: bytes | None = None
+            chunk_iter = None
+            if r.status_code == 200 and first_byte:
+                chunk_iter = r.aiter_bytes()
+                try:
+                    first = await chunk_iter.__anext__()
+                except StopAsyncIteration:
+                    first = None
+            return client, r, first, chunk_iter
+        except httpx.HTTPError as e:
+            if r is not None:
+                await r.aclose()
+            await client.aclose()
+            last_exc = e
+            kind = "连接" if r is None else "首块前"
+            _log(f"{prefix}✗ 网络错误({kind},{attempt}/{attempts}) | {model_name} | {e!r}")
+            if attempt < attempts:
+                await asyncio.sleep(1)
+    raise last_exc  # type: ignore[misc]
+
+
+async def _relay_chat(client: httpx.AsyncClient, r: httpx.Response, chunk_iter,
+                      first: bytes | None, model_name: str = "?", t0: float = 0.0, rid: str = ""):
+    """把调用方已建立的 200 上游流转发给客户端（标准 OpenAI SSE，剥空 tool_calls 数组）。
+
+    first/chunk_iter 来自 _open_upstream（首个 body 块已取出，需先行转发）。
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
-    完整原始 SSE（后端原样）累积后落盘到日志（调试用）。
+    完整原始 SSE（后端原样）累积后落盘到日志（调试用）。流中途断连时响应头
+    已发出无法改状态码，仍以 SSE 错误 chunk 收尾。
     """
     finish_reason = None
     tool_names: list[str] = []
     usage: dict = {}
     saw_filter = False
     buf = b""
-    raw_parts: list[bytes] = []   # 累积完整原始 SSE
+    raw_parts: list[bytes] = [first] if first else []   # 累积完整原始 SSE（首块已含）
     sse_buf = b""                 # 转发用行缓冲（按行剥空 tool_calls 后再发）
     prefix = f"[{rid}] " if rid else ""
 
@@ -763,31 +844,36 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
             if "content-filter" in text_repr or "敏感" in text_repr or "审核" in text_repr:
                 saw_filter = True
 
+    def _forward(chunk: bytes) -> bytes:
+        """统计 + 行缓冲转发，返回本块可发给客户端的字节。"""
+        nonlocal sse_buf
+        _feed(chunk)
+        sse_buf += chunk
+        if b"\n" not in sse_buf:
+            return b""
+        lines = sse_buf.split(b"\n")
+        sse_buf = lines.pop()  # 末段可能是不完整行，留待下一轮
+        return b"".join(_strip_empty_tool_calls(ln) + b"\n" for ln in lines)
+
     try:
-        async with httpx.AsyncClient(timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
-                    _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8','replace')}")
-                    yield _err_event(err, r.status_code)
-                    return
-                async for chunk in r.aiter_bytes():
-                    if chunk:
-                        raw_parts.append(chunk)
-                        _feed(chunk)
-                        sse_buf += chunk
-                        if b"\n" not in sse_buf:
-                            continue
-                        lines = sse_buf.split(b"\n")
-                        sse_buf = lines.pop()  # 末段可能是不完整行，留待下一轮
-                        if lines:
-                            yield b"".join(_strip_empty_tool_calls(ln) + b"\n" for ln in lines)
-                if sse_buf:
-                    yield _strip_empty_tool_calls(sse_buf)
+        if first:
+            out = _forward(first)
+            if out:
+                yield out
+        async for chunk in chunk_iter:
+            if chunk:
+                raw_parts.append(chunk)
+                out = _forward(chunk)
+                if out:
+                    yield out
+        if sse_buf:
+            yield _strip_empty_tool_calls(sse_buf)
     except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
-        yield _err_event(str(e).encode(), 502)
+        _log(f"{prefix}✗ 网络错误(流中) | {model_name} | {e!r}")
+        yield _err_event(str(e).encode() or b"upstream connection lost", 502)
+    finally:
+        await r.aclose()
+        await client.aclose()
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
@@ -839,26 +925,45 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
     )
 
 
-async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, bytes]:
-    async with httpx.AsyncClient(timeout=120) as c:
-        async with c.stream("POST", url, headers=headers, json=body) as r:
-            chunks: list[bytes] = []
-            async for chunk in r.aiter_bytes():
-                if chunk:
-                    chunks.append(chunk)
-            return r.status_code, b"".join(chunks)
+async def _post_backend_once(url: str, headers: dict, body: dict, *,
+                             attempts: int = 3, rid: str = "", model_name: str = "?") -> tuple[int, bytes]:
+    """整包拉取后端响应。连接失败 / 5xx 自动重试——调用方在拿到完整返回前不会向
+    客户端吐任何字节，重试安全（链路秒级抖动实测会成小时级爆发，2026-10-05）。
+    429/4xx 不重试（确定性错误或需客户端退避）。重试耗尽仍网络失败则抛异常。"""
+    prefix = f"[{rid}] " if rid else ""
+    last_exc: httpx.HTTPError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=120, trust_env=_trust_env()) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code in (502, 503, 504) and attempt < attempts:
+                        raw = await r.aread()
+                        _log(f"{prefix}✗ HTTP {r.status_code}({attempt}/{attempts},重试) | {model_name} | {_truncate(raw.decode('utf-8','replace'),120)}")
+                        await asyncio.sleep(1)
+                        continue
+                    chunks: list[bytes] = []
+                    async for chunk in r.aiter_bytes():
+                        if chunk:
+                            chunks.append(chunk)
+                    return r.status_code, b"".join(chunks)
+        except httpx.HTTPError as e:
+            last_exc = e
+            _log(f"{prefix}✗ 网络错误({attempt}/{attempts}) | {model_name} | {e!r}")
+            if attempt < attempts:
+                await asyncio.sleep(1)
+    raise last_exc  # type: ignore[misc]
 
 
 async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
                                           rid: str = "", model_name: str = "?") -> tuple[int, bytes, dict]:
     prefix = f"[{rid}] " if rid else ""
-    status, raw = await _post_backend_once(url, headers, body)
+    status, raw = await _post_backend_once(url, headers, body, rid=rid, model_name=model_name)
     text = raw.decode("utf-8", "replace")
     if status == 200 and _looks_like_content_filter_text(text) and CONFIG.get("desensitize") and CONFIG.get("no_compact"):
         retry_body = _chat_body_desensitize(body, force_compact=True)
         _log(f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness")
         _log(f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}")
-        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body)
+        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body, rid=rid, model_name=model_name)
         retry_text = retry_raw.decode("utf-8", "replace")
         if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
             return retry_status, retry_raw, retry_body
@@ -1080,19 +1185,25 @@ async def create_message(request: Request,
         conv = AnthropicStreamConverter(model=model_name)
         saw_events = False
         try:
-            async with httpx.AsyncClient(timeout=300) as c:
-                async with c.stream("POST", url, headers=headers, json=chat_body) as r:
-                    if r.status_code != 200:
-                        raw = await r.aread()
-                        _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
-                        _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
-                        return _anthropic_upstream_error(raw, r.status_code)
-                    async for line in r.aiter_lines():
-                        if conv.feed_line(line):
-                            saw_events = True
+            client, r, _, _ = await _open_upstream(url, headers, chat_body, rid=rid, model_name=model_name, first_byte=False)
         except httpx.HTTPError as e:
-            _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
-            return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}})
+            _log(f"[{rid}] ✗ 网络错误(重试耗尽) | {model_name} | {e!r}")
+            return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e!r}"}})
+        try:
+            if r.status_code != 200:
+                raw = await r.aread()
+                _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+                _log(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8','replace')}")
+                return _anthropic_upstream_error(raw, r.status_code)
+            async for line in r.aiter_lines():
+                if conv.feed_line(line):
+                    saw_events = True
+        except httpx.HTTPError as e:
+            _log(f"[{rid}] ✗ 网络错误(聚合中) | {model_name} | {e!r}")
+            return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e!r}"}})
+        finally:
+            await r.aclose()
+            await client.aclose()
         if not saw_events:
             _log(f"[{rid}] ⚠️ 非流式收到 0 个上游事件 | {model_name}")
         elapsed = time.time() - t0 if t0 else 0
@@ -1100,13 +1211,11 @@ async def create_message(request: Request,
         _log(f"[{rid}] ◀ ANTHROPIC {model_name} | {elapsed:.1f}s | nonstream done | stop={conv._finish_reason}")
         return JSONResponse(content=conv.get_nonstream_response())
 
-    client = httpx.AsyncClient(timeout=None)
     try:
-        r = await client.send(client.build_request("POST", url, headers=headers, json=chat_body), stream=True)
+        client, r, first, chunk_iter = await _open_upstream(url, headers, chat_body, rid=rid, model_name=model_name)
     except httpx.HTTPError as e:
-        await client.aclose()
-        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
-        return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e}"}})
+        _log(f"[{rid}] ✗ 网络错误(重试耗尽) | {model_name} | {e!r}")
+        return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": f"upstream error: {e!r}"}})
     if r.status_code != 200:
         err = await r.aread()
         await r.aclose()
@@ -1115,32 +1224,58 @@ async def create_message(request: Request,
         _log(f"[{rid}] ── ERROR BODY ──\n{err.decode('utf-8','replace')}")
         return _anthropic_upstream_error(err, r.status_code)
     return StreamingResponse(
-        _relay_anthropic(client, r, model_name, t0, rid),
+        _relay_anthropic(client, r, chunk_iter, first, model_name, t0, rid),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-async def _relay_anthropic(client: httpx.AsyncClient, r: httpx.Response,
-                           model_name: str = "?", t0: float = 0.0, rid: str = ""):
+async def _relay_anthropic(client: httpx.AsyncClient, r: httpx.Response, chunk_iter,
+                           first: bytes | None, model_name: str = "?", t0: float = 0.0, rid: str = ""):
     """把调用方已建立的 200 上游流转换为 Anthropic Messages SSE 转发给客户端。
 
-    非 200 的上游响应在路由里预检时已用真实状态码报错，这里只消费 200 流；
-    流中途断连仍以 Anthropic error 事件收尾（此时响应头已发出，改不了状态码）。
+    上游是 OpenAI SSE 字节流（首块已由 _open_upstream 取出待转发），这里自行按行
+    切分喂给转换器。非 200 的上游响应在路由里预检时已用真实状态码报错，这里只
+    消费 200 流；流中途断连仍以 Anthropic error 事件收尾（此时响应头已发出，
+    改不了状态码）。
     """
     converter = AnthropicStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
+    line_buf = b""
+
+    def _feed_lines(chunk: bytes) -> str:
+        nonlocal line_buf
+        out = ""
+        line_buf += chunk
+        if b"\n" not in line_buf:
+            return out
+        lines = line_buf.split(b"\n")
+        line_buf = lines.pop()
+        for ln in lines:
+            out += converter.feed_line(ln.decode("utf-8", "replace"))
+        return out
+
     try:
-        async for line in r.aiter_lines():
-            events = converter.feed_line(line)
+        if first:
+            events = _feed_lines(first)
             if events:
                 yield events.encode("utf-8")
+        async for chunk in chunk_iter:
+            if chunk:
+                events = _feed_lines(chunk)
+                if events:
+                    yield events.encode("utf-8")
+        if line_buf:
+            tail = converter.feed_line(line_buf.decode("utf-8", "replace"))
+            line_buf = b""
+            if tail:
+                yield tail.encode("utf-8")
         finish_events = converter.finish()
         if finish_events:
             yield finish_events.encode("utf-8")
     except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误(流中) | {model_name} | {e}")
-        error_evt = {"type": "error", "error": {"message": str(e)[:500], "type": "api_error", "code": 502}}
+        _log(f"{prefix}✗ 网络错误(流中) | {model_name} | {e!r}")
+        error_evt = {"type": "error", "error": {"message": (str(e) or "upstream connection lost")[:500], "type": "api_error", "code": 502}}
         yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
     finally:
         await r.aclose()
